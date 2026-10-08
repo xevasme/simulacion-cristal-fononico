@@ -4,93 +4,111 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 import matplotlib.pyplot as plt
 
-# 1. LECTURA DE LA MALLA
+# 1. LECTURA DE LA MALLA Y GRUPOS FÍSICOS
 malla = meshio.read("placa_64_cilindros.msh")
-nodos = malla.points[:, :2]           # Extraemos coordenadas X e Y
-elementos = malla.cells_dict["triangle"] # Nodos que componen cada triángulo
+nodos = malla.points[:, :2]
+elementos = malla.cells_dict["triangle"]
 num_nodos = len(nodos)
+num_elementos = len(elementos) # <--- Variable definida desde el principio
 
-# 2. PARÁMETROS FÍSICOS (Ecuación de Helmholtz)
-frecuencia = 2490.0   # Frecuencia de prueba en Hz
-c0 = 343.0            # Velocidad del sonido en el aire (m/s)
-# Se añade una pequeñísima parte imaginaria para simular leve atenuación del aire 
-# y evitar resonancias numéricas infinitas al no tener una frontera PML perfecta
-k = (2 * np.pi * frecuencia) / c0 + 0.02j 
+lineas = malla.cells_dict["line"]
+inlet_lines = lineas[malla.cell_sets_dict["Inlet"]["line"]]
+nodos_entrada = np.unique(inlet_lines)
 
-# 3. INICIALIZACIÓN DE LA MATRIZ DISPERSA
-filas = []
-columnas = []
-valores_K = [] # Rigidez (gradientes de presión)
-valores_M = [] # Masa (término de inercia acústica)
+# 2. PARÁMETROS FÍSICOS
+frecuencia = 2490.0 
+c0 = 343.0 
+k0 = (2 * np.pi * frecuencia) / c0 
 
-# 4. ENSAMBLAJE GLOBAL
-for elemento in elementos:
-    # Coordenadas de los 3 vértices del triángulo
-    x = nodos[elemento, 0]
-    y = nodos[elemento, 1]
-    
-    # Cálculo del área (Determinante del Jacobiano)
-    J = np.array([[x[1]-x[0], x[2]-x[0]], 
-                  [y[1]-y[0], y[2]-y[0]]])
-    area = 0.5 * abs(np.linalg.det(J))
-    
-    # Derivadas espaciales (Funciones de forma)
-    b = np.array([y[1]-y[2], y[2]-y[0], y[0]-y[1]]) / (2*area)
-    c = np.array([x[2]-x[1], x[0]-x[2], x[1]-x[0]]) / (2*area)
-    
-    # Matrices elementales de FEM
-    K_local = (np.outer(b, b) + np.outer(c, c)) * area
-    M_local = np.array([[2, 1, 1], 
-                        [1, 2, 1], 
-                        [1, 1, 2]]) * (area / 12.0)
-    
-    # Mapeo a las listas de la matriz global dispersa
-    for i in range(3):
-        for j in range(3):
-            filas.append(elemento[i])
-            columnas.append(elemento[j])
-            valores_K.append(K_local[i, j])
-            valores_M.append(M_local[i, j])
+# 3. ENSAMBLAJE GLOBAL VECTORIZADO
+x = nodos[elementos, 0]
+y = nodos[elementos, 1]
 
-# Construcción eficiente de matrices dispersas (evita el colapso de memoria)
+x21 = x[:, 1] - x[:, 0]
+x31 = x[:, 2] - x[:, 0]
+y21 = y[:, 1] - y[:, 0]
+y31 = y[:, 2] - y[:, 0]
+
+area = 0.5 * np.abs(x21 * y31 - x31 * y21)
+
+b = np.column_stack([y[:, 1] - y[:, 2], y[:, 2] - y[:, 0], y[:, 0] - y[:, 1]]) / (2 * area[:, None])
+c = np.column_stack([x[:, 2] - x[:, 1], x[:, 0] - x[:, 2], x[:, 1] - x[:, 0]]) / (2 * area[:, None])
+
+# --- INICIO ZONA PML (Absorbing Layer) ---
+xc = np.mean(x, axis=1)
+yc = np.mean(y, axis=1)
+
+xmin, xmax = np.min(nodos[:,0]), np.max(nodos[:,0])
+ymin, ymax = np.min(nodos[:,1]), np.max(nodos[:,1])
+
+# El PML en X solo se aplica fuertemente al final del dominio (Outlet)
+# para no ahogar la fuente que inyecta en X=0
+dist_x = np.maximum(0, xmax - xc) 
+dist_y = np.minimum(yc - ymin, ymax - yc)
+
+grosor_pml = 0.20  
+sigma_max = 50.0   
+
+sigma_x = np.zeros(num_elementos)
+sigma_y = np.zeros(num_elementos)
+
+mask_x = dist_x < grosor_pml
+sigma_x[mask_x] = sigma_max * ((grosor_pml - dist_x[mask_x]) / grosor_pml)**2
+
+mask_y = dist_y < grosor_pml
+sigma_y[mask_y] = sigma_max * ((grosor_pml - dist_y[mask_y]) / grosor_pml)**2
+
+k_local = k0 - 1j * (sigma_x + sigma_y)
+# --- FIN ZONA PML ---
+
+num_elementos = len(elementos)
+filas = np.zeros((num_elementos, 3, 3), dtype=int)
+columnas = np.zeros((num_elementos, 3, 3), dtype=int)
+# IMPORTANTE: valores_M debe ser complejo para no perder el término iterativo del PML
+valores_K = np.zeros((num_elementos, 3, 3), dtype=float)
+valores_M = np.zeros((num_elementos, 3, 3), dtype=complex) 
+
+M_ref = np.array([[2, 1, 1], [1, 2, 1], [1, 1, 2]]) / 12.0
+
+for i in range(3):
+    for j in range(3):
+        filas[:, i, j] = elementos[:, i]
+        columnas[:, i, j] = elementos[:, j]
+        valores_K[:, i, j] = (b[:, i] * b[:, j] + c[:, i] * c[:, j]) * area
+        valores_M[:, i, j] = M_ref[i, j] * area * (k_local**2)
+
+filas = filas.flatten()
+columnas = columnas.flatten()
+valores_K = valores_K.flatten()
+valores_M = valores_M.flatten()
+
 K_global = sp.coo_matrix((valores_K, (filas, columnas)), shape=(num_nodos, num_nodos)).tocsr()
-M_global = sp.coo_matrix((valores_M, (filas, columnas)), shape=(num_nodos, num_nodos)).tocsr()
+M_global_mod = sp.coo_matrix((valores_M, (filas, columnas)), shape=(num_nodos, num_nodos)).tocsr()
 
-# Sistema de Helmholtz: [K - k^2 M] * P = F
-A = K_global - (k**2) * M_global
+A = K_global - M_global_mod
 b_vector = np.zeros(num_nodos, dtype=complex)
 
-# 5. CONDICIONES DE FRONTERA
-# Identificar nodos en el margen izquierdo (x cercano a 0) para inyectar la onda
-tolerancia = 1e-3
-nodos_entrada = np.where(nodos[:, 0] <= tolerancia)[0]
+# 4. CONDICIONES DE FRONTERA (Método de Penalización)
+penalizacion = 1e15
 
-# Aplicar condición de Dirichlet (Presión = 1 Pa) en el emisor
 for nodo in nodos_entrada:
-    # Desconectar el nodo del resto del dominio vaciando su fila
-    A.data[A.indptr[nodo]:A.indptr[nodo+1]] = 0 
-    A[nodo, nodo] = 1.0                         
-    b_vector[nodo] = 1.0 + 0j
+    A[nodo, nodo] += penalizacion 
+    b_vector[nodo] = 1.0 * penalizacion
 
-# Nota: Los cilindros ya tienen condición de Neumann (velocidad normal nula) 
-# de forma implícita gracias a la formulación variacional de FEM.
-
-# 6. SOLUCIÓN DIRECTA DEL SISTEMA
-# Inversión matemática mediante solver subyacente en C/Fortran
+# 5. SOLUCIÓN DIRECTA DEL SISTEMA
 presion_compleja = spla.spsolve(A, b_vector)
 
-# 7. POST-PROCESAMIENTO Y VISUALIZACIÓN TERMOGRÁFICA
+# 6. POST-PROCESAMIENTO Y VISUALIZACIÓN TERMOGRÁFICA
 presion_real = np.real(presion_compleja)
 
 plt.figure(figsize=(10, 5))
-# tripcolor interpola los valores nodales sobre la malla triangular
 mapa = plt.tripcolor(nodos[:, 0], nodos[:, 1], elementos, presion_real, 
                      shading='gouraud', cmap='RdBu_r')
 
 plt.colorbar(mapa, label='Presión Acústica (Pa)')
-plt.title(f'Campo de Presión Acústica a {frecuencia} Hz')
+plt.title(f'Campo de Presión Acústica a {frecuencia} Hz con PML')
 plt.xlabel('Eje X (m)')
 plt.ylabel('Eje Y (m)')
-plt.gca().set_aspect('equal') # Mantiene la proporción geométrica real
+plt.gca().set_aspect('equal')
 plt.tight_layout()
 plt.show()
